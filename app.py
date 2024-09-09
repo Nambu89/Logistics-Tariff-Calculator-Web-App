@@ -1,8 +1,21 @@
-from flask import Flask, render_template, request, session
+from flask import Flask, jsonify, render_template, request, session
 import pandas as pd
 import numpy as np
+import os
+from werkzeug.utils import secure_filename
+import logging
+import json
+import unittest
+from collections import defaultdict
+import csv
+from datetime import datetime
+
+# Configuración básica del logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# TODO: Cambiar esto por una clave secreta generada de forma segura en producción
 app.secret_key = 'supersecretkey'  # Necesario para manejar la sesión de usuario
 
 # Cargar los archivos Excel
@@ -11,10 +24,15 @@ file_path_ontime = 'Tarifas_ONTIME.xlsx'
 file_path_mrw = 'Tarifas_MRW.xlsx'
 file_path_productos = 'Productos.xlsx'
 
+# Carga de datos
 df_cbl = pd.read_excel(file_path_cbl)
 df_ontime = pd.read_excel(file_path_ontime)
 df_mrw = pd.read_excel(file_path_mrw)
 df_productos = pd.read_excel(file_path_productos)
+
+# Convertir las comas en puntos para manejar correctamente los decimales en las columnas numéricas
+df_productos['PESO BRUTO (kg)'] = df_productos['PESO BRUTO (kg)'].astype(str).str.replace(',', '.').astype(float)
+df_productos['VOLUMEN (m3)'] = df_productos['VOLUMEN (m3)'].astype(str).str.replace(',', '.').astype(float)
 
 # Normalizar los nombres de las columnas para evitar problemas de formato
 df_cbl.columns = df_cbl.columns.str.strip().str.upper()
@@ -28,46 +46,215 @@ df_mrw = df_mrw.dropna(subset=['KG'])
 df_cbl['KG'] = pd.to_numeric(df_cbl['KG'], errors='coerce')
 df_cbl = df_cbl.dropna(subset=['KG'])
 
-# Definir las listas de provincias
-provincias_mrw = [
-    "VALENCIA", "ALBACETE", "ALICANTE", "CASTELLON", "CUENCA", "BARCELONA", "TARRAGONA", "MADRID", "MURCIA",
-    "ALMERIA", "ZARAGOZA", "GUADALAJARA", "TOLEDO", "GIRONA", "LLEIDA", "CORDOBA", "GRANADA", "SEVILLA",
-    "JAEN", "CIUDAD REAL", "BURGOS", "SEGOVIA", "VALLADOLID", "LA RIOJA", "NAVARRA", "VIZCAYA", "CADIZ",
-    "MALAGA", "HUESCA", "ASTURIAS", "CANTABRIA", "AVILA", "LEON", "BADAJOZ", "CACERES", "VIZCAYA", "GUIPUZKOA",
-    "HUELVA", "TERUEL", "PALENCIA", "SALAMANCA", "SORIA", "ZAMORA", "A CORUÑA", "LUGO", "ORENSE", "PONTEVEDRA",
-    "MALLORCA", "IBIZA", "MENORCA"
-]
+# Configuración para la carga de archivos
+UPLOAD_FOLDER = 'uploads'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-provincias_cbl = provincias_mrw
+# Constantes
+PALET_ANCHO = 0.8  # metros
+PALET_FONDO = 1.2  # metros
+PALET_ALTO_BASE = 0.15  # metros
+MAX_ALTO_PALET = 2.16  # metros
+MAX_PESO_XS = 40  # kg
+MAX_PESO_PALET = 400  # kg
 
-provincias_ontime = ["A CORUÑA", "ALAVA", "ALBACETE", "ALICANTE", "ALMERIA", "ASTURIAS", "AVILA", "BADAJOZ", "PALMA DE MALLORCA",
-    "MENORCA", "BARCELONA", "BURGOS", "CACERES", "CADIZ", "CANTABRIA", "CASTELLON", "CIUDAD REAL", "CORDOBA",
-    "CUENCA", "GUIPUZKOA", "GIRONA", "GRANADA", "GRAN CANARIA", "GUADALAJARA", "HUELVA", "HUESCA", "JAEN",
-    "LA RIOJA", "LANZAROTE", "LEON", "LLEIDA", "LUGO", "MADRID", "MALAGA", "MURCIA", "NAVARRA", "ORENSE",
-    "PALENCIA", "PONTEVEDRA", "SALAMANCA", "SEGOVIA", "SEVILLA", "SORIA", "TARRAGONA", "TERUEL", "TOLEDO",
-    "VALENCIA", "VALLADOLID", "VIZCAYA", "ZAMORA", "ZARAGOZA", "PORTUGAL LISBOA", "PORTUGAL OPORTO",
-    "PORTUGAL COIMBRA", "PORTUGAL ZONA2", "GIBRALTAR", "CEUTA", "MELILLA", "ANDORRA"
-]
+# Recargos
+RECARGO_COMBUSTIBLE_CBL = 0.035
+RECARGO_DEVOLUCION_CBL = 0.20
+RECARGO_COMBUSTIBLE_ONTIME = 0.04
+RECARGO_SEGURO_ONTIME = 0.04
 
-provincias_unificadas = list(set(provincias_mrw + provincias_cbl + provincias_ontime))
-provincias_unificadas.sort()  # Ordenar alfabéticamente
+# Definir el mapeo de columnas
+column_mapping = {
+    'ALTO EMBALAJE (MM)': ['ALTO EMBALAJE (MM)', 'ALTO EMBALAJE(MM)', 'ALTO'],
+    'ANCHO EMBALAJE (MM)': ['ANCHO EMBALAJE (MM)', 'ANCHO EMBALAJE (MM)', 'ANCHO'],
+    'FONDO EMBALAJE (MM)': ['FONDO EMBALAJE (MM)', 'FONDO EMBALAJE(MM)', 'FONDO']
+}
+
+class Producto:
+    """
+    Representa un producto con sus características físicas y de envío.
+    
+    """
+    def __init__(self, sku, categorias, alto, ancho, fondo, volumen, peso, cantidad, apilable = True, max_apilado = 2):
+        self.sku = sku
+        self.categorias = categorias
+        self.alto = alto / 1000  # Convertir de mm a m
+        self.ancho = ancho / 1000
+        self.fondo = fondo / 1000
+        self.volumen = volumen
+        self.peso = peso
+        self.cantidad = cantidad
+        self.peso_total = peso * cantidad
+        self.volumen_total = volumen * cantidad
+        self.apilable = apilable
+        self.max_apilado = max_apilado
+
+class Palet:
+    def __init__(self, ancho=PALET_ANCHO, fondo=PALET_FONDO, alto_max=MAX_ALTO_PALET, peso_max=MAX_PESO_PALET):
+        self.ancho = ancho
+        self.fondo = fondo
+        self.alto_max = alto_max
+        self.peso_max = peso_max
+        self.productos = []
+        self.peso_actual = 0
+        self.volumen_actual = 0
+        self.altura_actual = PALET_ALTO_BASE
+        self.espacio_disponible = [[0, 0, ancho, fondo]]  # [x, y, ancho, fondo]
+
+    def puede_agregar(self, producto):
+        if self.peso_actual + producto.peso > self.peso_max:
+            return False
+        
+        altura_necesaria = producto.alto
+        if any(p.sku == producto.sku for p in self.productos):
+            altura_necesaria /= producto.max_apilado
+        
+        if self.altura_actual + altura_necesaria > self.alto_max:
+            return False
+        
+        for espacio in self.espacio_disponible:
+            if producto.ancho <= espacio[2] and producto.fondo <= espacio[3]:
+                return True
+        return False
+
+    def agregar_producto(self, producto):
+        if not self.puede_agregar(producto):
+            return False
+
+        for i, espacio in enumerate(self.espacio_disponible):
+            if producto.ancho <= espacio[2] and producto.fondo <= espacio[3]:
+                x, y = espacio[0], espacio[1]
+                self.productos.append(producto)
+                self.peso_actual += producto.peso
+                self.volumen_actual += producto.volumen
+                self.altura_actual = max(self.altura_actual, self.altura_actual + producto.alto)
+
+                # Actualizar espacios disponibles
+                nuevo_espacio_derecha = [x + producto.ancho, y, espacio[2] - producto.ancho, espacio[3]]
+                nuevo_espacio_arriba = [x, y + producto.fondo, producto.ancho, espacio[3] - producto.fondo]
+                
+                self.espacio_disponible[i] = [x, y, producto.ancho, producto.fondo]
+                if nuevo_espacio_derecha[2] > 0:
+                    self.espacio_disponible.append(nuevo_espacio_derecha)
+                if nuevo_espacio_arriba[3] > 0:
+                    self.espacio_disponible.append(nuevo_espacio_arriba)
+                
+                self.espacio_disponible.sort(key=lambda e: e[0] * e[1])
+                return True
+        return False
+    
+# Este método empaqueta los productos en palets según las restricciones de peso, volumen y apilamiento.
+
+def empaquetar_productos(productos):
+    productos_ordenados = sorted(productos, key=lambda p: p.volumen_total, reverse=True)
+    palets = []  # Lista para almacenar los palets creados
+    productos_xs = []  # Lista para almacenar productos XS (pequeños)
+    productos_especiales = []  # Lista para productos que no caben en un palet estándar
+
+    for producto in productos_ordenados:
+        # Registrar información del producto en el log
+        logger.debug(f'Evaluando producto: SKU = {producto.sku}, peso total = {producto.peso_total}, volumen total = {producto.volumen_total}')
+        logger.debug(f'Dimensiones: Alto = {producto.alto}m, Ancho = {producto.ancho}m, Fondo = {producto.fondo}m')
+
+        # Verificar si el producto excede las dimensiones del palet
+        if producto.ancho > PALET_ANCHO or producto.fondo > PALET_FONDO or producto.alto > (MAX_ALTO_PALET - PALET_ALTO_BASE):
+            productos_especiales.append(producto)  # Agregar producto a la lista de productos especiales
+            logger.debug(f'Producto especial agregado: {producto.sku}')
+        
+        # Verificar si el producto puede clasificarse como XS (por debajo de ciertos límites de peso y volumen)
+        elif producto.peso_total <= MAX_PESO_XS and producto.volumen_total <= 0.25:
+            productos_xs.append(producto)  # Agregar a la lista de productos XS
+            logger.debug(f'Producto XS agregado: {producto.sku}')
+        
+        else:
+            # Calcular cuántas unidades caben en un palet según el peso, las dimensiones y la altura máxima de apilado
+            max_unidades_ancho = int(PALET_ANCHO // producto.ancho)  # Unidades posibles por ancho
+            max_unidades_fondo = int(PALET_FONDO // producto.fondo)  # Unidades posibles por fondo
+            max_unidades_alto = int((MAX_ALTO_PALET - PALET_ALTO_BASE) // producto.alto)  # Unidades apiladas en altura
+
+            # Restricción de apilamiento (si el producto es apilable)
+            if producto.apilable:
+                max_unidades_alto = min(max_unidades_alto, producto.max_apilado)
+
+            # Calcular el número máximo de unidades permitidas en el palet basándose en las tres dimensiones
+            max_unidades_dimensiones = max_unidades_ancho * max_unidades_fondo * max_unidades_alto
+
+            # Restringir también por el peso máximo del palet
+            max_unidades_peso = int(MAX_PESO_PALET // producto.peso)
+
+            # Determinar cuántas unidades del producto pueden caber por palet
+            unidades_por_palet = min(producto.cantidad, max_unidades_dimensiones, max_unidades_peso)
+            
+            # Mientras queden unidades del producto por empaquetar
+            while producto.cantidad > 0:
+                nuevo_palet = Palet()  # Crear un nuevo palet
+                unidades_este_palet = min(unidades_por_palet, producto.cantidad)  # Determinar cuántas unidades irán en este palet
+
+                # Crear un nuevo objeto Producto ajustando el peso y volumen según las unidades en el palet
+                nuevo_producto = Producto(
+                    producto.sku,
+                    producto.categorias,
+                    producto.alto * 1000,  # Convertir de metros a milímetros
+                    producto.ancho * 1000,
+                    producto.fondo * 1000,
+                    producto.volumen * unidades_este_palet,  # Volumen ajustado para las unidades en el palet
+                    producto.peso * unidades_este_palet,  # Peso ajustado para las unidades en el palet
+                    unidades_este_palet,  # Cantidad de unidades en este palet
+                    producto.apilable,
+                    producto.max_apilado
+                )
+
+                # Agregar el producto al palet
+                nuevo_palet.agregar_producto(nuevo_producto)
+                palets.append(nuevo_palet)  # Agregar el palet a la lista de palets
+                producto.cantidad -= unidades_este_palet  # Reducir la cantidad de productos restantes a empaquetar
+                logger.debug(f'Nuevo palet creado para {unidades_este_palet} unidades de {producto.sku}')
+
+    # Al final, registrar cuántos palets se crearon y cuántos productos XS y especiales hay
+    logger.debug(f"Palets creados: {len(palets)}, Productos XS: {len(productos_xs)}, Productos especiales: {len(productos_especiales)}")
+    
+    # Devolver la lista de palets creados, productos XS y productos especiales
+    return palets, productos_xs, productos_especiales
+
+
+# Obtener provincias
+provincias_cbl = set(df_cbl.columns[2:])
+provincias_ontime = set(df_ontime['PROVINCIA DESTINO'].unique())
+provincias_mrw = set(df_mrw.columns[1:])
+
+provincias_comunes = list(provincias_cbl.intersection(provincias_ontime, provincias_mrw))
+provincias_comunes.sort()
 
 # Obtener categorías y SKUs para los desplegables
 categorias = df_productos['CATEGORIAS'].unique().tolist()
 skus = df_productos['SKU'].unique().tolist()
 
 def obtener_tarifa_ontime(df, zona, peso):
-    tarifas_ontime = [int(col) for col in df.columns if col.isdigit()]
-    closest_weight_col = min((x for x in tarifas_ontime if x >= peso), default=None)
+    """
+    Obtiene la tarifa de ONTIME para un peso y zona específicos.
+    """
+    try:
+        tarifas_ontime = [int(col) for col in df.columns if col.isdigit()]
+        closest_weight_col = min((x for x in tarifas_ontime if x >= float(peso)), default=None)
 
-    if closest_weight_col is not None:
-        tarifa_ontime_row = df[df['PROVINCIA DESTINO'] == zona]
-        if not tarifa_ontime_row.empty:
-            return tarifa_ontime_row.iloc[0][str(closest_weight_col)]
+        if closest_weight_col is not None:
+            tarifa_ontime_row = df[df['PROVINCIA DESTINO'] == zona]
+            if not tarifa_ontime_row.empty:
+                return tarifa_ontime_row.iloc[0][str(closest_weight_col)]
 
-    return np.nan
+        return np.nan
+    except ValueError as e:
+        logger.error(f"Error en obtener_tarifa_ontime: {e}. Peso: {peso}, Zona: {zona}")
+        return np.nan
+    except Exception as e:
+        logger.error(f"Error inesperado en obtener_tarifa_ontime: {e}")
+        return np.nan
 
 def obtener_tarifa_ontime_xs(df, zona, peso, modalidad):
+    """
+    Obtiene la tarifa de ONTIME XS para un peso, zona y modalidad específicos.
+    """
     try:
         tarifas_ontime = [col for col in df.columns if modalidad in col]
         closest_weight_col = None
@@ -86,408 +273,417 @@ def obtener_tarifa_ontime_xs(df, zona, peso, modalidad):
         return np.nan
 
     except Exception as e:
-        print(f'Error en obtener_tarifa_ontime_xs: {e}')
+        logger.error(f"Error en obtener_tarifa_ontime_xs: {e}")
         return np.nan
 
 def obtener_tarifa_mrw(df, zona, peso_total, num_bultos):
-    filtered_df = df[df['KG'] >= peso_total]
-    if filtered_df.empty:
-        return np.nan, np.nan, np.nan
-    closest_weight_row = filtered_df.iloc[0]
-    tarifa_base = closest_weight_row[zona] if zona in df.columns else np.nan
-    recargo_bultos = max(0, num_bultos - 2) * 2
-    tarifa_total = tarifa_base + recargo_bultos
-    return tarifa_base, recargo_bultos, tarifa_total
+    """
+    Obtiene la tarifa de MRW para un peso total, zona y número de bultos específicos.
+    """
+    try:
+        peso_total = float(peso_total)
+        filtered_df = df[df['KG'] >= peso_total]
+        if filtered_df.empty:
+            return np.nan
+        closest_weight_row = filtered_df.iloc[0]
+        tarifa_base = closest_weight_row[zona] if zona in df.columns else np.nan
+        recargo_bultos = max(0, num_bultos - 2) * 2
+        tarifa_total = tarifa_base + recargo_bultos
+        return tarifa_total
+    except ValueError as e:
+        logger.error(f"Error en obtener_tarifa_mrw: {e}. Peso total: {peso_total}, Zona: {zona}, Num bultos: {num_bultos}")
+        return np.nan
+    except Exception as e:
+        logger.error(f"Error inesperado en obtener_tarifa_mrw: {e}")
+        return np.nan
 
 def obtener_tarifa_cbl(df, zona, peso):
+    """
+    Obtiene la tarifa de CBL para un peso y zona específicos.
+    """
     try:
+        peso = float(peso)
         filtered_df = df[df['KG'] >= peso]
         if filtered_df.empty:
             return np.nan
 
-        # Normalizar el nombre de la zona a mayúsculas y sin espacios
         zona = zona.strip().upper()
 
         if zona not in df.columns:
-            print(f"Columna '{zona}' no encontrada en las tarifas CBL.")
+            logger.error(f"Columna '{zona}' no encontrada en las tarifas CBL.")
             return np.nan
 
         closest_weight_row = filtered_df.iloc[0]
         return closest_weight_row[zona]
-    except KeyError as e:
-        print(f"Error inesperado al obtener tarifa CBL: columna {e}")
+    except ValueError as e:
+        logger.error(f"Error en obtener_tarifa_cbl: {e}. Peso: {peso}, Zona: {zona}")
         return np.nan
     except Exception as e:
-        print(f"Error inesperado al obtener tarifa CBL: {str(e)}")
+        logger.error(f"Error inesperado al obtener tarifa CBL: {str(e)}")
         return np.nan
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    result = None  # Inicializar result al inicio
-
-    # Inicializar la lista de envíos si no existe
-    if 'envios' not in session:
-        session['envios'] = []
-
+    """
+    Maneja la ruta principal de la aplicación.
+    """
     if request.method == 'POST':
-        tipo_producto = request.form.get('tipo_producto')
-        province = request.form.get('province')
-        num_bultos = int(request.form.get('num_bultos', 0))
-        modalidad = request.form.get('modalidad', None)
-        palet_type = request.form.get('palet_type')
-        product_height = float(request.form.get('height', 0))
-        category = request.form.get('category', None) if tipo_producto == 'XS' else None
-        sku = request.form.get('sku', None) if tipo_producto == 'XS' else None
+        if 'file' in request.files:
+            return procesar_pedidos_route()
+        elif 'calcular_devolucion' in request.form:
+            return calcular_devolucion()
+    return render_template('index.html', provincias=provincias_comunes)
 
-        envio = {
-            'tipo_producto': tipo_producto,
-            'province': province,
-            'num_bultos': num_bultos,
-            'modalidad': modalidad,
-            'palet_type': palet_type,
-            'product_height': product_height,
-            'category': category,
-            'sku': sku
-        }
+def allowed_file(filename):
+    """
+    Verifica si el archivo tiene una extensión permitida.
+    """
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'csv', 'xls', 'xlsx'}
 
-        if 'agregar_envio' in request.form:
-            # Determinar el mejor transportista para el envío
-            mejor_transportista = None
-            tarifa_mejor = None
+def serialize_numpy(obj):
+    """
+    Serializa objetos numpy y pandas para JSON.
+    """
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj) if not np.isnan(obj) else None
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient='records')
+    elif isinstance(obj, pd.Series):
+        return obj.to_dict()
+    elif pd.isna(obj):
+        return None
+    raise TypeError(f'Object of type {obj.__class__.__name__} is not JSON serializable')
 
-            if tipo_producto == 'Normal':
-                base_area = 0.6 * 0.8 if palet_type == 'Medio Palet' else 1.2 * 0.8
-                volume = base_area * (product_height + 0.15)
-                kgs_cbl = volume * 200
-                kgs_ontime = volume * 225
-
-                tarifa_cbl = obtener_tarifa_cbl(df_cbl, province, kgs_cbl)
-                tarifa_ontime = obtener_tarifa_ontime(df_ontime, province, kgs_ontime)
-
-                if not np.isnan(tarifa_cbl):
-                    recargo_combustible_cbl = tarifa_cbl * 0.035
-                    tarifa_cbl_total = tarifa_cbl + recargo_combustible_cbl
-                else:
-                    tarifa_cbl_total = np.nan
-
-                if not np.isnan(tarifa_ontime):
-                    recargo_combustible_ontime = tarifa_ontime * 0.04
-                    recargo_seguro_ontime = tarifa_ontime * 0.04
-                    tarifa_ontime_total = tarifa_ontime + recargo_combustible_ontime + recargo_seguro_ontime
-                else:
-                    tarifa_ontime_total = np.nan
-
-                tarifas = {"CBL": tarifa_cbl_total, "ONTIME": tarifa_ontime_total}
-                tarifas_validas = {k: v for k, v in tarifas.items() if not np.isnan(v)}
-                if tarifas_validas:
-                    mejor_transportista = min(tarifas_validas, key=tarifas_validas.get)
-                    tarifa_mejor = tarifas_validas[mejor_transportista]
-
-            elif tipo_producto == 'XS':
-                peso_producto = df_productos[(df_productos['CATEGORIAS'] == category) & (df_productos['SKU'] == sku)]['PESO BRUTO (kg)'].values
-                if len(peso_producto) > 0:
-                    peso_total = peso_producto[0] * num_bultos
-
-                    tarifa_base_mrw, recargo_bultos_mrw, tarifa_total_mrw = obtener_tarifa_mrw(df_mrw, province, peso_total, num_bultos)
-                    tarifa_ontime_xs = obtener_tarifa_ontime_xs(df_ontime, province, peso_total, modalidad)
-
-                    tarifa_cbl_total = np.nan
-                    if peso_total >= 10:
-                        tarifa_cbl = obtener_tarifa_cbl(df_cbl, province, peso_total)
-                        if not np.isnan(tarifa_cbl):
-                            recargo_combustible_cbl = tarifa_cbl * 0.035
-                            tarifa_cbl_total = tarifa_cbl + recargo_combustible_cbl
-
-                    tarifa_ontime_xs_total = np.nan
-                    if not np.isnan(tarifa_ontime_xs):
-                        recargo_combustible_ontime = tarifa_ontime_xs * 0.04
-                        recargo_seguro_ontime = tarifa_ontime_xs * 0.04
-                        tarifa_ontime_xs_total = tarifa_ontime_xs + recargo_combustible_ontime + recargo_seguro_ontime
-
-                    tarifas = {
-                        "MRW": tarifa_total_mrw,
-                        "CBL": tarifa_cbl_total,
-                        "ONTIME XS": tarifa_ontime_xs_total
-                    }
-
-                    tarifas_validas = {k: v for k, v in tarifas.items() if not np.isnan(v)}
-                    if tarifas_validas:
-                        mejor_transportista = min(tarifas_validas, key=tarifas_validas.get)
-                        tarifa_mejor = tarifas_validas[mejor_transportista]
-
-            # Agregar la información del envío con el mejor transportista
-            envio['mejor_transportista'] = mejor_transportista
-            envio['tarifa'] = tarifa_mejor
-
-            # Agregar el envío a la lista de la sesión
-            session['envios'].append(envio)
-            session.modified = True
-            result = "Envío agregado. Puede agregar más envíos o calcular el total."
-
-        elif 'calcular_total' in request.form:
-            total_mrw = 0
-            total_cbl = 0
-            total_ontime = 0
-
-            for envio in session['envios']:
-                tipo_producto = envio['tipo_producto']
-                province = envio['province']
-                num_bultos = envio['num_bultos']
-                modalidad = envio['modalidad']
-                palet_type = envio['palet_type']
-                product_height = envio['product_height']
-
-                if tipo_producto == 'Normal':
-                    base_area = 0.6 * 0.8 if palet_type == 'Medio Palet' else 1.2 * 0.8
-                    volume = base_area * (product_height + 0.15)
-                    kgs_cbl = volume * 200
-                    kgs_ontime = volume * 225
-
-                    tarifa_cbl = obtener_tarifa_cbl(df_cbl, province, kgs_cbl)
-                    tarifa_ontime = obtener_tarifa_ontime(df_ontime, province, kgs_ontime)
-
-                    if not np.isnan(tarifa_cbl):
-                        recargo_combustible_cbl = tarifa_cbl * 0.035
-                        total_cbl += tarifa_cbl + recargo_combustible_cbl
-
-                    if not np.isnan(tarifa_ontime):
-                        recargo_combustible_ontime = tarifa_ontime * 0.04
-                        recargo_seguro_ontime = tarifa_ontime * 0.04
-                        total_ontime += tarifa_ontime + recargo_combustible_ontime + recargo_seguro_ontime
-
-                elif tipo_producto == 'XS':
-                    category = envio.get('category')
-                    sku = envio.get('sku')
-                    peso_producto = df_productos[(df_productos['CATEGORIAS'] == category) & (df_productos['SKU'] == sku)]['PESO BRUTO (kg)'].values
-                    if len(peso_producto) == 0:
-                        continue
-                    peso_total = peso_producto[0] * num_bultos
-
-                    tarifa_base_mrw, recargo_bultos_mrw, tarifa_total_mrw = obtener_tarifa_mrw(df_mrw, province, peso_total, num_bultos)
-                    tarifa_ontime_xs = obtener_tarifa_ontime_xs(df_ontime, province, peso_total, modalidad)
-
-                    if not np.isnan(tarifa_total_mrw):
-                        total_mrw += tarifa_total_mrw
-
-                    if not np.isnan(tarifa_ontime_xs):
-                        recargo_combustible_ontime = tarifa_ontime_xs * 0.04
-                        recargo_seguro_ontime = tarifa_ontime_xs * 0.04
-                        total_ontime += tarifa_ontime_xs + recargo_combustible_ontime + recargo_seguro_ontime
-
-            # Determinar el transportista más económico
-            mejores_transportistas = {
-                "CBL": total_cbl,
-                "ONTIME": total_ontime
-            }
-            # Solo incluir MRW si hay envíos de tipo XS
-            if any(envio['tipo_producto'] == 'XS' for envio in session['envios']):
-                mejores_transportistas["MRW"] = total_mrw
-
-            # Filtrar transportistas con un costo total de 0€
-            mejores_transportistas = {k: v for k, v in mejores_transportistas.items() if v > 0}
-
-            if mejores_transportistas:
-                mejor_transportista = min(mejores_transportistas, key=mejores_transportistas.get)
-                result = (f'Total CBL: {total_cbl:.2f}€\nTotal ONTIME: {total_ontime:.2f}€\n'
-                          f'Mejor transportista: {mejor_transportista} con un costo total de '
-                          f'{mejores_transportistas[mejor_transportista]:.2f}€\n')
-                if 'MRW' in mejores_transportistas:
-                    result += f'Total MRW: {total_mrw:.2f}€\n'
-            else:
-                result = "No se encontraron tarifas válidas."
-
-            session['envios'] = []  # Limpiar la lista de envíos después de calcular
-
-        elif 'reiniciar_envios' in request.form:
-            # Lógica para reiniciar los envíos
-            session['envios'] = []
-            result = "Envíos reiniciados."
-
-        elif 'calcular' in request.form:
-            # Lógica de cálculo normal
-            if tipo_producto == 'Normal':
-                base_area = 0.6 * 0.8 if palet_type == 'Medio Palet' else 1.2 * 0.8
-                volume = base_area * (product_height + 0.15)
-                kgs_cbl = volume * 200
-                kgs_ontime = volume * 225
-
-                tarifa_cbl = obtener_tarifa_cbl(df_cbl, province, kgs_cbl)
-                tarifa_ontime = obtener_tarifa_ontime(df_ontime, province, kgs_ontime)
-
-                result = (f"Para {palet_type} con altura {product_height}m y destino {province}:\n"
-                          f"Volumen: {volume:.2f} m³\n"
-                          f"KGS (CBL): {kgs_cbl:.2f} kg\n"
-                          f"KGS (ONTIME): {kgs_ontime:.2f} kg\n\n")
-
-                if not np.isnan(tarifa_cbl):
-                    recargo_combustible_cbl = tarifa_cbl * 0.035
-                    tarifa_cbl_total = tarifa_cbl + recargo_combustible_cbl
-                    result += (f"Tarifa base CBL para {province}: {tarifa_cbl:.2f}€\n"
-                               f"Recargo por combustible CBL (3.5%): {recargo_combustible_cbl:.2f}€\n"
-                               f"Total tarifa CBL con recargo: {tarifa_cbl_total:.2f}€\n")
-                else:
-                    tarifa_cbl_total = np.nan
-                    result += "Tarifa CBL: No disponible\n"
-
-                if not np.isnan(tarifa_ontime):
-                    recargo_combustible_ontime = tarifa_ontime * 0.04
-                    recargo_seguro_ontime = tarifa_ontime * 0.04
-                    tarifa_ontime_total = tarifa_ontime + recargo_combustible_ontime + recargo_seguro_ontime
-                    result += (f"Tarifa base ONTIME para {province}: {tarifa_ontime:.2f}€\n"
-                               f"Recargo por combustible ONTIME (4%): {recargo_combustible_ontime:.2f}€\n"
-                               f"Recargo por seguro ONTIME (4%): {recargo_seguro_ontime:.2f}€\n"
-                               f"Total tarifa ONTIME con recargos: {tarifa_ontime_total:.2f}€\n")
-                else:
-                    tarifa_ontime_total = np.nan
-                    result += "Tarifa ONTIME: No disponible\n"
-
-                tarifas = {"CBL": tarifa_cbl_total, "ONTIME": tarifa_ontime_total}
-                tarifas_validas = {k: v for k, v in tarifas.items() if not np.isnan(v)}
-                if tarifas_validas:
-                    mejor_transportista = min(tarifas_validas, key=tarifas_validas.get)
-                    result += f'\nMejor transportista: {mejor_transportista} con tarifa {tarifas_validas[mejor_transportista]:.2f}€\n'
-                else:
-                    result += "\nNo se encontró un transportista válido.\n"
-
-            elif tipo_producto == 'XS':
-                peso_producto = df_productos[(df_productos['CATEGORIAS'] == category) & (df_productos['SKU'] == sku)]['PESO BRUTO (kg)'].values
-                if len(peso_producto) == 0:
-                    result = 'No se encontró el producto con la categoría y SKU especificados.'
-                else:
-                    peso_total = peso_producto[0] * num_bultos
-
-                    tarifa_base_mrw, recargo_bultos_mrw, tarifa_total_mrw = obtener_tarifa_mrw(df_mrw, province, peso_total, num_bultos)
-                    tarifa_ontime_xs = obtener_tarifa_ontime_xs(df_ontime, province, peso_total, modalidad)
-
-                    result = f'Para {num_bultos} bultos con SKU {sku} con peso total de {peso_total}kg y destino {province}:\n'
-                    
-                    if not np.isnan(tarifa_total_mrw):
-                        result += (f'Tarifa base MRW: {tarifa_base_mrw:.2f}€\n'
-                                f'Recargo por bultos extra MRW: {recargo_bultos_mrw:.2f}€\n'
-                                f'Total tarifa MRW con recargos: {tarifa_total_mrw:.2f}€\n')
-                    else:
-                        result += "Tarifa MRW: No disponible\n"
-
-                    tarifa_cbl_total = np.nan
-                    if peso_total >= 10:
-                        tarifa_cbl = obtener_tarifa_cbl(df_cbl, province, peso_total)
-                        if not np.isnan(tarifa_cbl):
-                            recargo_combustible_cbl = tarifa_cbl * 0.035
-                            tarifa_cbl_total = tarifa_cbl + recargo_combustible_cbl
-                            result += (f'Tarifa base CBL: {tarifa_cbl:.2f}€\n'
-                                    f'Recargo por combustible CBL (3.5%): {recargo_combustible_cbl:.2f}€\n'
-                                    f'Total tarifa CBL con recargo: {tarifa_cbl_total:.2f}€\n')
-                        else:
-                            result += "Tarifa CBL: No disponible\n"
-
-                    tarifa_ontime_xs_total = np.nan # Inicializar la variable con un valor predeterminado
-
-                    if not np.isnan(tarifa_ontime_xs):
-                        recargo_combustible_ontime = tarifa_ontime_xs * 0.04
-                        recargo_seguro_ontime = tarifa_ontime_xs * 0.04
-                        tarifa_ontime_xs_total = tarifa_ontime_xs + recargo_combustible_ontime + recargo_seguro_ontime
-                        result += (f'Tarifa ONTIME XS ({modalidad} horas): {tarifa_ontime_xs:.2f}€\n'
-                                f'Recargo por combustible ONTIME XS (4%): {recargo_combustible_ontime:.2f}€\n'
-                                f'Recargo por seguro ONTIME XS (4%): {recargo_seguro_ontime:.2f}€\n'
-                                f'Total tarifa ONTIME XS con recargos: {tarifa_ontime_xs_total:.2f}€\n')
-                    else:
-                        result += "Tarifa ONTIME XS: No disponible\n"
-
-                    tarifas = {
-                        "MRW": tarifa_total_mrw,
-                        "CBL": tarifa_cbl_total,
-                        "ONTIME XS": tarifa_ontime_xs_total
-                    }
-
-                    tarifas_validas = {k: v for k, v in tarifas.items() if not np.isnan(v)}
-                    if tarifas_validas:
-                        mejor_transportista = min(tarifas_validas, key=tarifas_validas.get)
-                        result += f'\nMejor transportista: {mejor_transportista} con tarifa {tarifas_validas[mejor_transportista]:.2f}€\n'
-                    else:
-                        result += "\nNo se encontró un transportista válido.\n"
-
-    return render_template('index.html', result=result, provincias_unificadas=provincias_unificadas, categorias=categorias, skus=skus, envios=session['envios'])
-
-def calculate_return_tariff(province, tipo_producto, categoria, sku, num_bultos, height=None):
-    province_normalized = province  # No se realiza normalización
-    tarifa_cbl_total = np.nan
-    tarifa_ontime_total = np.nan
-
-    if tipo_producto == 'Normal':
-        if not height:  # Verificar si la altura fue proporcionada
-            return "Debe seleccionar una altura para el producto."
+@app.route('/procesar_pedido', methods=['POST'])
+def procesar_pedidos_route():
+    """
+    Procesa el pedido subido por el usuario.
+    """
+    if 'file' not in request.files or 'provincia' not in request.form:
+        return jsonify({'error': 'No se ha subido un archivo o no se ha seleccionado una provincia'}), 400
+    
+    file = request.files['file']
+    provincia = request.form['provincia']
+    
+    if file.filename == '' or provincia == '':
+        return jsonify({'error': 'No se ha seleccionado un archivo o una provincia'}), 400
+    
+    if provincia not in provincias_comunes:
+        return jsonify({'error': 'La provincia seleccionada no es válida'}), 400
+    
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
 
         try:
-            altura_producto = float(height)  # Convertir la altura seleccionada a un valor float
-        except ValueError:
-            return "La altura seleccionada no es válida."
+            df_pedido = pd.read_excel(filepath, engine='openpyxl')
+            
+            if df_pedido.shape[1] < 2:
+                return jsonify({'error': 'El archivo debe tener al menos 2 columnas'}), 400
 
-        base_area = 1.2 * 0.8
-        volume = base_area * (altura_producto + 0.15)
-        peso_total_cbl = volume * 200
-        peso_total_ontime = volume * 225
+            df_pedido.columns = df_pedido.columns.str.strip().str.lower()
+            if 'nº' in df_pedido.columns:
+                df_pedido.rename(columns={'nº': 'sku'}, inplace=True)
+            
+            # Verifica la presencia de todas las columnas necesarias
+            required_columns = ['sku', 'cantidad', 'peso bruto total', 'volumen']
+            missing_columns = [col for col in required_columns if col not in df_pedido.columns]
 
-        # Calcular tarifa CBL con recargos
-        tarifa_cbl = obtener_tarifa_cbl(df_cbl, province_normalized, peso_total_cbl)
-        if not np.isnan(tarifa_cbl):
-            recargo_combustible_cbl = tarifa_cbl * 0.035
-            recargo_devolucion = tarifa_cbl * 0.2
-            tarifa_cbl_total = tarifa_cbl + recargo_combustible_cbl + recargo_devolucion
+            if missing_columns:
+                return jsonify({'error': f'El archivo no contiene las columnas requeridas: {", ".join(missing_columns)}'}), 400
 
-        # Calcular tarifa ONTIME con recargos
-        tarifa_ontime = obtener_tarifa_ontime(df_ontime, province_normalized, peso_total_ontime)
-        if not np.isnan(tarifa_ontime):
-            recargo_combustible_ontime = tarifa_ontime * 0.04
-            recargo_seguro_ontime = tarifa_ontime * 0.04
-            tarifa_ontime_total = tarifa_ontime + recargo_combustible_ontime + recargo_seguro_ontime
+            # Renombrar columnas si es necesario
+            column_mapping_pedido = {
+                'cantidad': 'cantidad',
+                'peso bruto total': 'peso bruto total',
+                'volumen': 'volumen'
+            }
+            df_pedido.rename(columns=column_mapping_pedido, inplace=True)
 
-    elif tipo_producto == 'XS':
-        # Calcular peso del producto XS
-        peso_producto = df_productos[
-            (df_productos['CATEGORIAS'] == categoria) &
-            (df_productos['SKU'] == sku)
-        ]['PESO BRUTO (kg)'].values
+            logger.debug("Iniciando procesamiento del pedido")
+            resultados = procesar_pedido(df_pedido, provincia)
+            logger.debug(f"Resultados procesados: {json.dumps(resultados, default=serialize_numpy)}")
 
-        if len(peso_producto) == 0:
-            return "Producto no encontrado."
+            if not resultados:
+                logger.warning("No se generaron resultados después del procesamiento")
+                return jsonify({'error': 'No se encontraron productos que se pudieran procesar'}), 400
+            
+            # Guardar los resultados en el CSV
+            guardar_registro_envio(resultados, provincia)
+            
+            # Convertir resultados a un formato serializable
+            serializable_resultados = json.loads(json.dumps(resultados, default=serialize_numpy))
+            return jsonify(serializable_resultados)
+        
+        except Exception as e:
+            logger.error(f"Error en procesar_pedidos_route: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return jsonify({'error': str(e)}), 500
+        finally:
+            os.remove(filepath)
+    else:
+        return jsonify({'error': 'Tipo de archivo no permitido'}), 400
 
-        peso_total = peso_producto[0] * int(num_bultos)
+def procesar_pedido(df_pedido, provincia):
+    productos = []
 
-        # Calcular tarifa CBL con recargos
-        tarifa_cbl = obtener_tarifa_cbl(df_cbl, province_normalized, peso_total)
-        if not np.isnan(tarifa_cbl):
-            recargo_combustible_cbl = tarifa_cbl * 0.035
-            recargo_devolucion = tarifa_cbl * 0.2
-            tarifa_cbl_total = tarifa_cbl + recargo_combustible_cbl + recargo_devolucion
+    for _, row in df_pedido.iterrows():
+        sku = str(row['sku']).upper()
+        cantidad = int(row['cantidad'])
 
-        # Calcular tarifa ONTIME XS con recargos
-        tarifa_ontime_xs = obtener_tarifa_ontime_xs(df_ontime, province_normalized, peso_total, '24')
-        if not np.isnan(tarifa_ontime_xs):
-            recargo_combustible_ontime = tarifa_ontime_xs * 0.04
-            recargo_seguro_ontime = tarifa_ontime_xs * 0.04
-            tarifa_ontime_total = tarifa_ontime_xs + recargo_combustible_ontime + recargo_seguro_ontime
+        producto_info = df_productos[df_productos['SKU'] == sku]
+        
+        if producto_info.empty:
+            logger.warning(f'No se encontró información para el SKU: {sku}. Usando datos del pedido.')
+            peso = float(row['peso bruto total'])
+            volumen = float(row['volumen'])
+            alto = ancho = fondo = (volumen ** (1 / 3)) * 1000
+            apilable = False
+            max_apilado = 1
+        else:
+            producto_info = producto_info.iloc[0]
+            peso = float(producto_info['PESO BRUTO (kg)'])
+            volumen = float(producto_info['VOLUMEN (m3)'])
+            alto = float(producto_info['ALTO EMBALAJE (MM)'])
+            ancho = float(producto_info['ANCHO EMBALAJE (MM)'])
+            fondo = float(producto_info['FONDO EMBALAJE (MM)'])
+            apilable = producto_info.get('APILABLE', True)
+            max_apilado = int(producto_info.get('MAX_APILADO', 2))
 
-    # Comparar tarifas y mostrar el mejor resultado
-    tarifas = {'CBL': tarifa_cbl_total, 'ONTIME': tarifa_ontime_total}
-    tarifas_validas = {k: v for k, v in tarifas.items() if not np.isnan(v)}
+        productos.append(Producto(sku, producto_info['CATEGORIAS'] if not producto_info.empty else 'DESCONOCIDO',
+                                  alto, ancho, fondo, volumen, peso, cantidad, apilable, max_apilado))
 
-    if not tarifas_validas:
-        return 'No se encontraron tarifas válidas para la devolución.'
+    palets, productos_xs, productos_especiales = empaquetar_productos(productos)
 
-    mejor_transportista = min(tarifas_validas, key=tarifas_validas.get)
+    resultados = []
 
-    # Mostrar el resultado
-    result = (f'Para devolución desde {province} a Valencia con producto tipo {tipo_producto}:\n'
-            f'Tarifa CBL: {tarifa_cbl:.2f}€\n'
-            f'Recargo de CBL por combustible (3.5%): {recargo_combustible_cbl:.2f}€\n'
-            f'Recargo de CBL por devolución (20%): {recargo_devolucion:.2f}€\n'
-            f'Tarifa total CBL: {tarifa_cbl_total:.2f}€\n'
-            f'Tarifa ONTIME: {tarifa_ontime:.2f}€\n'
-            f'Recargo de ONTIME por combustible (4%): {recargo_combustible_ontime:.2f}€\n'
-            f'Recargo de ONTIME por seguro (4%): {recargo_seguro_ontime:.2f}€\n'
-            f'Tarifa total ONTIME: {tarifa_ontime_total:.2f}€\n')
+    # Procesar palets
+    for i, palet in enumerate(palets):
+        tarifas = calcular_tarifas_palet({'peso': palet.peso_actual, 'volumen': palet.volumen_actual}, provincia)
+        transportista_optimo, tarifa_optima = min(tarifas.items(), key=lambda x: x[1] if not pd.isna(x[1]) else float('inf'))
+        resultados.append({
+            'tipo': 'Palet',
+            'numero': i + 1,
+            'productos': [{'SKU': p.sku, 'CANTIDAD': p.cantidad} for p in palet.productos],
+            'peso': palet.peso_actual,
+            'volumen': palet.volumen_actual,
+            'transportista_optimo': transportista_optimo,
+            'tarifa_optima': tarifa_optima,
+            'tarifas': tarifas
+        })
+    
+    # Procesar productos XS
+    if productos_xs:
+        tarifas = calcular_tarifas_xs({'peso': sum(p.peso_total for p in productos_xs), 'volumen': sum(p.volumen_total for p in productos_xs)}, provincia)
+        transportista_optimo, tarifa_optima = min(tarifas.items(), key=lambda x: x[1] if not pd.isna(x[1]) else float('inf'))
+        resultados.append({
+            'tipo': 'XS',
+            'productos': [{'SKU': p.sku, 'CANTIDAD': p.cantidad} for p in productos_xs],
+            'peso': sum(p.peso_total for p in productos_xs),
+            'volumen': sum(p.volumen_total for p in productos_xs),
+            'transportista_optimo': transportista_optimo,
+            'tarifa_optima': tarifa_optima,
+            'tarifas': tarifas
+        })
+    
+    # Procesar productos especiales
+    if productos_especiales:
+        resultados.append({
+            'tipo': 'Especial',
+            'productos': [{'SKU': p.sku, 'CANTIDAD': p.cantidad} for p in productos_especiales],
+            'mensaje': 'Preguntar a Manel'
+        })
 
-    return result
+    return resultados
+
+def guardar_registro_envio(resultados, provincia):
+    """"
+    Guarda los detalles de cada envío en un archivo CSV.
+
+    :param resultados: Lista de diccionarios con los resultados del envío.
+    :param provincia: Provincia de destinod del envío.
+    """
+    # Definir el archivo CSV
+    file_path = 'registros_envio.csv'
+
+    # Verificar si el archivo existe para decidir si escribir el encabezado
+    archivo_existe = os.path.isfile(file_path)
+
+    # Obtener fecha y hora actual
+    fecha_actual = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Abrir el archivo en modo agregar ('a')
+    with open(file_path, mode = 'a', newline = '', encoding = 'utf-8') as file:
+        writer = csv.writer(file)
+
+        # Escribir el encabezado si el archivo es nuevo
+        if not archivo_existe:
+            writer.writerow([
+                'Tipo', 'Numero Palet', 'SKU', 'Cantidad', 'Peso Total', 
+                'Volumen Total', 'Transportista Optimo', 'Tarifa Optima', 
+                'Provincia', 'Fecha', 'Mensaje'
+            ])
+        
+        # Iterar sobre los resultados procesados de cada envío y guardar los datos
+        for resultado in resultados:
+            tipo = resultado.get('tipo', 'Desconocido')
+            if tipo == 'Palet':
+                numero_palet = resultado.get('numero', '')  # Puede estar ausente
+                transportista = resultado.get('transportista_optimo', 'Desconocido')
+                tarifa = resultado.get('tarifa_optima', 0)
+                mensaje = ''  # No se necesita mensaje para palet
+                for producto in resultado.get('productos', []):
+                    writer.writerow([
+                        tipo,
+                        numero_palet,
+                        producto['SKU'],
+                        producto['CANTIDAD'],
+                        resultado.get('peso', 0),
+                        resultado.get('volumen', 0),
+                        transportista,
+                        tarifa,
+                        provincia,
+                        fecha_actual,
+                        mensaje
+                    ])
+            elif tipo == 'Especial':
+                numero_palet = ''  # No aplica para productos especiales
+                transportista = ''  # No aplica
+                tarifa = ''  # No aplica
+                mensaje = resultado.get('mensaje', '')
+                for producto in resultado.get('productos', []):
+                    writer.writerow([
+                        tipo,
+                        numero_palet,
+                        producto['SKU'],
+                        producto['CANTIDAD'],
+                        resultado.get('peso', 0),
+                        resultado.get('volumen', 0),
+                        transportista,
+                        tarifa,
+                        provincia,
+                        fecha_actual,
+                        mensaje
+                    ])
+
+def calcular_tarifas_envios(envios, provincia):
+    """
+    Calcula las tarifas para una lista de envíos.
+    """
+    resultados = []
+    for envio in envios:
+        if 'es_palet' not in envio:
+            logger.error(f"Envío sin información de 'es_palet': {envio}")
+            resultados.append({'error': 'Falta información de "es_palet" en el envío'})
+            continue
+
+        # Verificar si 'productos' existe
+        if 'productos' not in envio:
+            logger.error(f"Envío sin 'productos': {envio}")
+            resultados.append({'error': 'Falta información de productos en el envío'})
+            continue
+        
+        # Calcula las tarifas para cada transportista
+        if envio['es_palet']:
+            tarifas = calcular_tarifas_palet(envio, provincia)
+        else:
+            tarifas = calcular_tarifas_xs(envio, provincia)
+
+        # Seleccionar el transportista más barato
+        transportista_optimo = None
+        tarifa_optima = float('inf')
+        for transportista, tarifa in tarifas.items():
+            if not np.isnan(tarifa) and tarifa < tarifa_optima:
+                transportista_optimo = transportista
+                tarifa_optima = tarifa
+
+        resultado = {
+            'productos': envio['productos'],
+            'peso': envio['peso'],
+            'volumen': envio['volumen'],
+            'es_palet': envio['es_palet'],
+            'transportista_optimo': transportista_optimo,
+            'tarifa_optima': tarifa_optima,
+            'tarifas': tarifas,
+            'notas': envio.get('notas', '')
+        }
+        resultados.append(resultado)
+
+    if not resultados:
+        return [{'error': 'No se pudo calcular ninguna tarifa'}]
+
+    return resultados
+
+def calcular_tarifas_xs(envio, provincia):
+    """
+    Calcula las tarifas para envíos XS.
+    """
+    if envio['peso'] < 10:
+        tarifa_mrw = obtener_tarifa_mrw(df_mrw, provincia, envio['peso'], 1)  # Asumimos 1 bulto para XS
+        tarifa_ontime = obtener_tarifa_ontime_xs(df_ontime, provincia, envio['peso'], '24')
+        return {
+            'MRW': tarifa_mrw if not pd.isna(tarifa_mrw) else None,
+            'ONTIME': (tarifa_ontime * (1 + RECARGO_COMBUSTIBLE_ONTIME + RECARGO_SEGURO_ONTIME)) if not pd.isna(tarifa_ontime) else None
+        }
+    else:
+        tarifa_mrw = obtener_tarifa_mrw(df_mrw, provincia, envio['peso'], 1)  # Asumimos 1 bulto para XS
+        tarifa_cbl = obtener_tarifa_cbl(df_cbl, provincia, envio['peso'])
+        tarifa_ontime = obtener_tarifa_ontime_xs(df_ontime, provincia, envio['peso'], '24')
+        return {
+            'MRW': tarifa_mrw if not pd.isna(tarifa_mrw) else None,
+            'CBL': (tarifa_cbl * (1 + RECARGO_COMBUSTIBLE_CBL)) if not pd.isna(tarifa_cbl) else None,
+            'ONTIME': (tarifa_ontime * (1 + RECARGO_COMBUSTIBLE_ONTIME + RECARGO_SEGURO_ONTIME)) if not pd.isna(tarifa_ontime) else None
+        }
+
+def calcular_tarifas_palet(envio, provincia):
+    """
+    Calcula las tarifas para envíos en palet.
+    """
+    peso_volumetrico_cbl = envio['volumen'] * 200
+    peso_volumetrico_ontime = envio['volumen'] * 225
+
+    tarifa_cbl = obtener_tarifa_cbl(df_cbl, provincia, peso_volumetrico_cbl)
+    tarifa_ontime = obtener_tarifa_ontime(df_ontime, provincia, peso_volumetrico_ontime)
+
+    return {
+        'CBL': (tarifa_cbl * (1 + RECARGO_COMBUSTIBLE_CBL)) if not pd.isna(tarifa_cbl) else None,
+        'ONTIME': (tarifa_ontime * (1 + RECARGO_COMBUSTIBLE_ONTIME + RECARGO_SEGURO_ONTIME)) if not pd.isna(tarifa_ontime) else None
+    }
+
+
+def calcular_devolucion():
+    """
+    Calcula las tarifas de devolución para un producto específico.
+    """
+    provincia = request.form['provincia']
+    sku = request.form['sku']
+    cantidad = int(request.form['cantidad'])
+
+    producto = df_productos[df_productos['SKU'] == sku].iloc[0]
+    peso_total = producto['PESO BRUTO (kg)'] * cantidad
+    volumen = producto['ALTO EMBALAJE (MM)'] / 1000 * producto['ANCHO EMBALAJE (MM)'] / 1000 * producto['FONDO EMBALAJE (MM)'] / 1000 * cantidad
+
+    if peso_total < MAX_PESO_XS:
+        tarifas = calcular_tarifas_xs({'peso': peso_total, 'volumen': volumen, 'productos': [{'SKU': sku, 'CANTIDAD': cantidad}]}, provincia)
+    else:
+        tarifas = calcular_tarifas_palet({'peso': peso_total, 'volumen': volumen, 'productos': [{'SKU': sku, 'CANTIDAD': cantidad}]}, provincia)
+
+    tarifas_devolucion = {}
+    for transportista, tarifa in tarifas.items():
+        if not np.isnan(tarifa):
+            if transportista == 'CBL':
+                tarifas_devolucion[transportista] = tarifa * (1 + RECARGO_DEVOLUCION_CBL)
+            else:
+                tarifas_devolucion[transportista] = tarifa  # No se aplica recargo adicional para otros transportistas
+
+    return render_template('index.html', resultado_devolucion=tarifas_devolucion, provincias=provincias_comunes)
 
 if __name__ == '__main__':
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     app.run(debug=True)

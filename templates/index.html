@@ -4,100 +4,153 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Calculadora de Transporte</title>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script>
-        function toggleFields() {
-            const tipoProducto = document.getElementById('tipo_producto').value;
-            const paletType = document.getElementById('palet_type');
-            const height = document.getElementById('height');
-            const category = document.getElementById('category');
-            const sku = document.getElementById('sku');
-            const modalidad = document.getElementById('modalidad');
-            const numBultos = document.getElementById('num_bultos');
+        $(document).ready(function() {
+            $('#pedido-form').on('submit', function(e) {
+                e.preventDefault();
+                var formData = new FormData(this);
+                
+                $.ajax({
+                    url: '/procesar_pedido',
+                    type: 'POST',
+                    data: formData,
+                    contentType: false,
+                    processData: false,
+                    success: function(response) {
+                        console.log('Respuesta del servidor:', response);
+                        try {
+                            $('#resultados').html(formatResults(response));
+                        } catch (error) {
+                            console.error('Error al formatear resultados:', error);
+                            $('#resultados').html('<p>Error al procesar los resultados. Por favor, revise la consola para más detalles.</p>');
+                        }
+                    },
+                    error: function(xhr, status, error) {
+                        console.error('Error en la solicitud AJAX:', status, error);
+                        $('#resultados').html('<p>Error: ' + (xhr.responseJSON ? xhr.responseJSON.error : error) + '</p>');
+                    }
+                });
+            });
 
-            if (tipoProducto === 'Normal') {
-                paletType.disabled = false;
-                height.disabled = false;
-                category.disabled = true;
-                sku.disabled = true;
-                modalidad.disabled = true;
-                numBultos.disabled = true;
-            } else if (tipoProducto === 'XS') {
-                paletType.disabled = true;
-                height.disabled = true;
-                category.disabled = false;
-                sku.disabled = false;
-                modalidad.disabled = false;
-                numBultos.disabled = false;
+            function formatResults(results) {
+                console.log('Formateando resultados:', results);
+                if (!results || results.length === 0) {
+                    return '<p>No se encontraron resultados.</p>';
+                }
+
+                let html = '<h2>Resultados del Pedido</h2>';
+                let totalEnvios = {
+                    'Palet': 0,
+                    'XS': 0,
+                    'Especial': 0
+                };
+
+                results.forEach((envio, index) => {
+                    html += `<h3>Envío ${index + 1} - ${envio.tipo}</h3>`;
+                    totalEnvios[envio.tipo]++;
+
+                    if (envio.error) {
+                        html += `<p>Error: ${envio.error}</p>`;
+                        return;
+                    }
+
+                    if (envio.tipo === 'Especial') {
+                        html += `<p>${envio.mensaje}</p>`;
+                    } else {
+                        html += `<p>Peso: ${envio.peso ? envio.peso.toFixed(2) : 'N/A'} kg</p>`;
+                        html += `<p>Volumen: ${envio.volumen ? envio.volumen.toFixed(2) : 'N/A'} m³</p>`;
+
+                        if (envio.transportista_optimo) {
+                            html += `<p>Transportista más barato: ${envio.transportista_optimo} (${envio.tarifa_optima ? envio.tarifa_optima.toFixed(2) : 'N/A'}€)</p>`;
+                        } else {
+                            html += `<p>No se encontró un transportista óptimo.</p>`;
+                        }
+
+                        if (envio.tarifas) {
+                            html += '<h4>Tarifas:</h4><ul>';
+                            for (let transportista in envio.tarifas) {
+                                let tarifa = envio.tarifas[transportista];
+                                if (tarifa !== null && !isNaN(tarifa)) {
+                                    html += `<li>${transportista}: ${tarifa.toFixed(2)}€</li>`;
+                                } else {
+                                    html += `<li>${transportista}: No disponible</li>`;
+                                }
+                            }
+                            html += '</ul>';
+                        }
+                    }
+
+                    if (envio.productos && Array.isArray(envio.productos)) {
+                        html += '<h4>Productos:</h4><ul>';
+                        envio.productos.forEach(prod => {
+                            html += `<li>SKU: ${prod.SKU}, Cantidad: ${prod.CANTIDAD}</li>`;
+                        });
+                        html += '</ul>';
+                    } else {
+                        console.warn('Productos no encontrados o no es un array:', envio.productos);
+                        html += '<p>Productos no disponibles</p>';
+                    }
+                });
+
+                html += '<h3>Resumen de Envíos</h3>';
+                html += `<p>Palets: ${totalEnvios['Palet']}</p>`;
+                html += `<p>XS: ${totalEnvios['XS']}</p>`;
+                html += `<p>Especiales: ${totalEnvios['Especial']}</p>`;
+
+                return html;
             }
-        }
-
-        window.onload = toggleFields;
+        });
     </script>
 </head>
 <body>
     <h1>Calculadora de Transporte</h1>
-    <form method="POST">
-
-        <label for="tipo_producto">Tipo de Producto:</label>
-        <select id="tipo_producto" name="tipo_producto" onchange="toggleFields()">
-            <option value="Normal" {% if request.form.get('tipo_producto') == 'Normal' %}selected{% endif %}>Normal</option>
-            <option value="XS" {% if request.form.get('tipo_producto') == 'XS' %}selected{% endif %}>XS</option>
-        </select><br><br>
-
-        <label for="palet_type">Tipo de Palet:</label>
-        <select id="palet_type" name="palet_type">
-            <option value="Medio Palet" {% if request.form.get('palet_type') == 'Medio Palet' %}selected{% endif %}>Medio Palet</option>
-            <option value="Palet Completo" {% if request.form.get('palet_type') == 'Palet Completo' %}selected{% endif %}>Palet Completo</option>
-        </select><br><br>
-
-        <label for="height">Altura del Producto:</label>
-        <select id="height" name="height">
-            <option value="0.45" {% if request.form.get('height') == '0.45' %}selected{% endif %}>0.45</option>
-            <option value="0.6" {% if request.form.get('height') == '0.6' %}selected{% endif %}>0.6</option>
-            <option value="0.85" {% if request.form.get('height') == '0.85' %}selected{% endif %}>0.85</option>
-            <option value="1.45" {% if request.form.get('height') == '1.45' %}selected{% endif %}>1.45</option>
-            <option value="1.6" {% if request.form.get('height') == '1.6' %}selected{% endif %}>1.6</option>
-            <option value="1.85" {% if request.form.get('height') == '1.85' %}selected{% endif %}>1.85</option>
-            <option value="2.01" {% if request.form.get('height') == '2.01' %}selected{% endif %}>2.01</option>
-        </select><br><br>
-
-        <label for="province">Provincia de Destino:</label>
-        <select id="province" name="province">
-            {% for provincia in provincias_unificadas %}
-                <option value="{{ provincia }}" {% if request.form.get('province') == provincia %}selected{% endif %}>{{ provincia }}</option>
+    
+    <h2>Cargar Pedido</h2>
+    <form id="pedido-form" enctype="multipart/form-data">
+        <label for="provincia">Provincia:</label>
+        <select name="provincia" id="provincia" required>
+            {% for provincia in provincias %}
+                <option value="{{ provincia }}">{{ provincia }}</option>
             {% endfor %}
         </select><br><br>
+        <label for="file">Archivo de Pedido:</label>
+        <input type="file" name="file" id="file" accept=".csv,.xlsx,.xls" required><br><br>
+        <button type="submit">Procesar Pedido</button>
+    </form>
 
-        <label for="category">Categoría del Producto:</label>
-        <select id="category" name="category" {% if request.form.get('tipo_producto') != 'XS' %}disabled{% endif %}>
-            {% for categoria in categorias %}
-                <option value="{{ categoria }}" {% if request.form.get('category') == categoria %}selected{% endif %}>{{ categoria }}</option>
+    <div id="resultados"></div>
+
+    <h2>Calcular Devolución</h2>
+    <form method="POST" action="/calcular_devolucion">
+        <label for="provincia-devolucion">Provincia:</label>
+        <select name="provincia" id="provincia-devolucion" required>
+            {% for provincia in provincias %}
+                <option value="{{ provincia }}">{{ provincia }}</option>
             {% endfor %}
         </select><br><br>
 
         <label for="sku">SKU del Producto:</label>
-        <select id="sku" name="sku" {% if request.form.get('tipo_producto') != 'XS' %}disabled{% endif %}>
-            {% for sku in skus %}
-                <option value="{{ sku }}" {% if request.form.get('sku') == sku %}selected{% endif %}>{{ sku }}</option>
-            {% endfor %}
-        </select><br><br>
+        <input type="text" name="sku" id="sku" required><br><br>
 
-        <label for="modalidad">Modalidad (horas):</label>
-        <select name="modalidad" id="modalidad" {% if request.form.get('tipo_producto') != 'XS' %}disabled{% endif %}>
-            <option value="24" {% if request.form.get('modalidad') == '24' %}selected{% endif %}>24 horas</option>
-            <option value="48" {% if request.form.get('modalidad') == '48' %}selected{% endif %}>48 horas</option>
-        </select><br><br>
+        <label for="cantidad">Cantidad:</label>
+        <input type="number" name="cantidad" id="cantidad" required min="1"><br><br>
 
-        <label for="num_bultos">Número de Bultos:</label>
-        <input type="number" name="num_bultos" id="num_bultos" value="{{ request.form.get('num_bultos') }}" {% if request.form.get('tipo_producto') != 'XS' %}disabled{% endif %}><br><br>
-
-        <input type="submit" name="calcular" value="Calcular">
-        <input type="submit" name="devolucion" value="Calcular Devolución">
+        <input type="submit" value="Calcular Devolución">
     </form>
 
-    {% if result %}
-        <h2>Resultado</h2>
-        <pre>{{ result }}</pre>
+    {% if resultado_devolucion %}
+        <h2>Resultado de la Devolución</h2>
+        <ul>
+        {% for transportista, tarifa in resultado_devolucion.items() %}
+            <li>{{ transportista }}: {{ tarifa|round(2) }}€</li>
+        {% endfor %}
+        </ul>
+    {% endif %}
+
+    {% if error %}
+        <h2>Error</h2>
+        <p>{{ error }}</p>
     {% endif %}
 </body>
 </html>

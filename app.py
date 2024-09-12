@@ -15,7 +15,6 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# TODO: Cambiar esto por una clave secreta generada de forma segura en producción
 app.secret_key = 'supersecretkey'  # Necesario para manejar la sesión de usuario
 
 # Cargar los archivos Excel
@@ -64,19 +63,11 @@ RECARGO_DEVOLUCION_CBL = 0.20
 RECARGO_COMBUSTIBLE_ONTIME = 0.04
 RECARGO_SEGURO_ONTIME = 0.04
 
-# Definir el mapeo de columnas
-column_mapping = {
-    'ALTO EMBALAJE (MM)': ['ALTO EMBALAJE (MM)', 'ALTO EMBALAJE(MM)', 'ALTO'],
-    'ANCHO EMBALAJE (MM)': ['ANCHO EMBALAJE (MM)', 'ANCHO EMBALAJE (MM)', 'ANCHO'],
-    'FONDO EMBALAJE (MM)': ['FONDO EMBALAJE (MM)', 'FONDO EMBALAJE(MM)', 'FONDO']
-}
-
 class Producto:
     """
     Representa un producto con sus características físicas y de envío.
-    
     """
-    def __init__(self, sku, categorias, alto, ancho, fondo, volumen, peso, cantidad, apilable = True, max_apilado = 2):
+    def __init__(self, sku, categorias, alto, ancho, fondo, volumen, peso, cantidad, apilable=True, max_apilado=2):
         self.sku = sku
         self.categorias = categorias
         self.alto = alto / 1000  # Convertir de mm a m
@@ -90,6 +81,14 @@ class Producto:
         self.apilable = apilable
         self.max_apilado = max_apilado
 
+        # Lógica específica para COMBI y LAVADORA
+        if 'COMBI' in categorias.upper():
+            self.apilable = False
+            self.max_apilado = 2  # Máximo 2 combis por palet
+        elif 'LAVADORA' in categorias.upper():
+            self.apilable = True
+            self.max_apilado = 8  # Máximo 8 lavadoras por palet
+
 class Palet:
     def __init__(self, ancho=PALET_ANCHO, fondo=PALET_FONDO, alto_max=MAX_ALTO_PALET, peso_max=MAX_PESO_PALET):
         self.ancho = ancho
@@ -100,121 +99,119 @@ class Palet:
         self.peso_actual = 0
         self.volumen_actual = 0
         self.altura_actual = PALET_ALTO_BASE
-        self.espacio_disponible = [[0, 0, ancho, fondo]]  # [x, y, ancho, fondo]
 
-    def puede_agregar(self, producto):
-        if self.peso_actual + producto.peso > self.peso_max:
-            return False
-        
-        altura_necesaria = producto.alto
-        if any(p.sku == producto.sku for p in self.productos):
-            altura_necesaria /= producto.max_apilado
-        
-        if self.altura_actual + altura_necesaria > self.alto_max:
-            return False
-        
-        for espacio in self.espacio_disponible:
-            if producto.ancho <= espacio[2] and producto.fondo <= espacio[3]:
-                return True
-        return False
+    def puede_agregar(self, producto, cantidad=1):
+        peso_total_producto = producto.peso * cantidad
+        niveles_nuevos = ((cantidad - 1) // 4 + 1)  # Cada nivel puede tener hasta 4 lavadoras
+        altura_total_producto = producto.alto * niveles_nuevos
 
-    def agregar_producto(self, producto):
-        if not self.puede_agregar(producto):
+        # Verificar si excede el peso máximo del palet
+        if self.peso_actual + peso_total_producto > self.peso_max:
             return False
 
-        for i, espacio in enumerate(self.espacio_disponible):
-            if producto.ancho <= espacio[2] and producto.fondo <= espacio[3]:
-                x, y = espacio[0], espacio[1]
-                self.productos.append(producto)
-                self.peso_actual += producto.peso
-                self.volumen_actual += producto.volumen
-                self.altura_actual = max(self.altura_actual, self.altura_actual + producto.alto)
+        # Verificar si excede la altura máxima del palet
+        if self.altura_actual + altura_total_producto > self.alto_max:
+            return False
 
-                # Actualizar espacios disponibles
-                nuevo_espacio_derecha = [x + producto.ancho, y, espacio[2] - producto.ancho, espacio[3]]
-                nuevo_espacio_arriba = [x, y + producto.fondo, producto.ancho, espacio[3] - producto.fondo]
-                
-                self.espacio_disponible[i] = [x, y, producto.ancho, producto.fondo]
-                if nuevo_espacio_derecha[2] > 0:
-                    self.espacio_disponible.append(nuevo_espacio_derecha)
-                if nuevo_espacio_arriba[3] > 0:
-                    self.espacio_disponible.append(nuevo_espacio_arriba)
-                
-                self.espacio_disponible.sort(key=lambda e: e[0] * e[1])
-                return True
-        return False
-    
-# Este método empaqueta los productos en palets según las restricciones de peso, volumen y apilamiento.
+        # Restricciones específicas para COMBI y LAVADORA
+        if 'COMBI' in producto.categorias.upper():
+            total_combis = sum(p['cantidad'] for p in self.productos if 'COMBI' in p['categorias'].upper())
+            if total_combis + cantidad > 2:
+                return False
+        elif 'LAVADORA' in producto.categorias.upper():
+            total_lavadoras = sum(p['cantidad'] for p in self.productos if 'LAVADORA' in p['categorias'].upper())
+            if total_lavadoras + cantidad > producto.max_apilado:
+                return False
+
+        # Verificar si hay espacio en el palet (simplificado)
+        return True
+
+    def agregar_producto(self, producto, cantidad=1):
+        if not self.puede_agregar(producto, cantidad):
+            return False
+
+        peso_total_producto = producto.peso * cantidad
+        altura_por_nivel = producto.alto
+        niveles_nuevos = ( (cantidad - 1) // 4 + 1 )  # Calcula cuántos niveles nuevos se necesitan
+
+        # Actualizar o agregar el producto en la lista de productos
+        existing_product = next((p for p in self.productos if p['sku'] == producto.sku), None)
+        if existing_product:
+            existing_product['cantidad'] += cantidad
+        else:
+            self.productos.append({
+                'sku': producto.sku,
+                'categorias': producto.categorias,
+                'cantidad': cantidad,
+                'peso': producto.peso,
+                'volumen': producto.volumen,
+                'ancho': producto.ancho,
+                'fondo': producto.fondo,
+                'alto': producto.alto
+            })
+        # Actualizar peso y altura del palet
+        self.peso_actual += peso_total_producto
+        self.volumen_actual += producto.volumen * cantidad
+        self.altura_actual += altura_por_nivel * niveles_nuevos
+
+        return True
 
 def empaquetar_productos(productos):
     productos_ordenados = sorted(productos, key=lambda p: p.volumen_total, reverse=True)
-    palets = []  # Lista para almacenar los palets creados
-    productos_xs = []  # Lista para almacenar productos XS (pequeños)
-    productos_especiales = []  # Lista para productos que no caben en un palet estándar
+    palets = []
+    productos_xs = []
+    productos_especiales = []
 
     for producto in productos_ordenados:
-        # Registrar información del producto en el log
         logger.debug(f'Evaluando producto: SKU = {producto.sku}, peso total = {producto.peso_total}, volumen total = {producto.volumen_total}')
         logger.debug(f'Dimensiones: Alto = {producto.alto}m, Ancho = {producto.ancho}m, Fondo = {producto.fondo}m')
 
-        # Verificar si el producto excede las dimensiones del palet
         if producto.ancho > PALET_ANCHO or producto.fondo > PALET_FONDO or producto.alto > (MAX_ALTO_PALET - PALET_ALTO_BASE):
-            productos_especiales.append(producto)  # Agregar producto a la lista de productos especiales
+            productos_especiales.append(producto)
             logger.debug(f'Producto especial agregado: {producto.sku}')
-        
-        # Verificar si el producto puede clasificarse como XS (por debajo de ciertos límites de peso y volumen)
         elif producto.peso_total <= MAX_PESO_XS and producto.volumen_total <= 0.25:
-            productos_xs.append(producto)  # Agregar a la lista de productos XS
+            productos_xs.append(producto)
             logger.debug(f'Producto XS agregado: {producto.sku}')
-        
         else:
-            # Calcular cuántas unidades caben en un palet según el peso, las dimensiones y la altura máxima de apilado
-            max_unidades_ancho = int(PALET_ANCHO // producto.ancho)  # Unidades posibles por ancho
-            max_unidades_fondo = int(PALET_FONDO // producto.fondo)  # Unidades posibles por fondo
-            max_unidades_alto = int((MAX_ALTO_PALET - PALET_ALTO_BASE) // producto.alto)  # Unidades apiladas en altura
+            unidades_restantes = producto.cantidad
+            while unidades_restantes > 0:
+                palet_encontrado = False
+                for palet in palets:
+                    cantidad_max_por_peso = int((palet.peso_max - palet.peso_actual) // producto.peso)
+                    cantidad_max_por_apilado = producto.max_apilado - sum(
+                        p['cantidad'] for p in palet.productos if p['sku'] == producto.sku
+                    )
+                    cantidad_maxima = min(unidades_restantes, cantidad_max_por_peso, cantidad_max_por_apilado)
 
-            # Restricción de apilamiento (si el producto es apilable)
-            if producto.apilable:
-                max_unidades_alto = min(max_unidades_alto, producto.max_apilado)
+                    if cantidad_maxima <= 0:
+                        continue
 
-            # Calcular el número máximo de unidades permitidas en el palet basándose en las tres dimensiones
-            max_unidades_dimensiones = max_unidades_ancho * max_unidades_fondo * max_unidades_alto
+                    if palet.puede_agregar(producto, cantidad_maxima):
+                        palet.agregar_producto(producto, cantidad_maxima)
+                        unidades_restantes -= cantidad_maxima
+                        palet_encontrado = True
+                        break
 
-            # Restringir también por el peso máximo del palet
-            max_unidades_peso = int(MAX_PESO_PALET // producto.peso)
+                if not palet_encontrado:
+                    nuevo_palet = Palet()
+                    cantidad_max_por_peso = int(nuevo_palet.peso_max // producto.peso)
+                    cantidad_maxima = min(unidades_restantes, cantidad_max_por_peso, producto.max_apilado)
 
-            # Determinar cuántas unidades del producto pueden caber por palet
-            unidades_por_palet = min(producto.cantidad, max_unidades_dimensiones, max_unidades_peso)
-            
-            # Mientras queden unidades del producto por empaquetar
-            while producto.cantidad > 0:
-                nuevo_palet = Palet()  # Crear un nuevo palet
-                unidades_este_palet = min(unidades_por_palet, producto.cantidad)  # Determinar cuántas unidades irán en este palet
+                    if cantidad_maxima <= 0:
+                        productos_especiales.append(producto)
+                        unidades_restantes = 0
+                        break
 
-                # Crear un nuevo objeto Producto ajustando el peso y volumen según las unidades en el palet
-                nuevo_producto = Producto(
-                    producto.sku,
-                    producto.categorias,
-                    producto.alto * 1000,  # Convertir de metros a milímetros
-                    producto.ancho * 1000,
-                    producto.fondo * 1000,
-                    producto.volumen * unidades_este_palet,  # Volumen ajustado para las unidades en el palet
-                    producto.peso * unidades_este_palet,  # Peso ajustado para las unidades en el palet
-                    unidades_este_palet,  # Cantidad de unidades en este palet
-                    producto.apilable,
-                    producto.max_apilado
-                )
+                    if nuevo_palet.puede_agregar(producto, cantidad_maxima):
+                        nuevo_palet.agregar_producto(producto, cantidad_maxima)
+                        palets.append(nuevo_palet)
+                        unidades_restantes -= cantidad_maxima
+                    else:
+                        productos_especiales.append(producto)
+                        unidades_restantes = 0
+                        break
 
-                # Agregar el producto al palet
-                nuevo_palet.agregar_producto(nuevo_producto)
-                palets.append(nuevo_palet)  # Agregar el palet a la lista de palets
-                producto.cantidad -= unidades_este_palet  # Reducir la cantidad de productos restantes a empaquetar
-                logger.debug(f'Nuevo palet creado para {unidades_este_palet} unidades de {producto.sku}')
-
-    # Al final, registrar cuántos palets se crearon y cuántos productos XS y especiales hay
     logger.debug(f"Palets creados: {len(palets)}, Productos XS: {len(productos_xs)}, Productos especiales: {len(productos_especiales)}")
-    
-    # Devolver la lista de palets creados, productos XS y productos especiales
     return palets, productos_xs, productos_especiales
 
 
@@ -397,14 +394,6 @@ def procesar_pedidos_route():
             if missing_columns:
                 return jsonify({'error': f'El archivo no contiene las columnas requeridas: {", ".join(missing_columns)}'}), 400
 
-            # Renombrar columnas si es necesario
-            column_mapping_pedido = {
-                'cantidad': 'cantidad',
-                'peso bruto total': 'peso bruto total',
-                'volumen': 'volumen'
-            }
-            df_pedido.rename(columns=column_mapping_pedido, inplace=True)
-
             logger.debug("Iniciando procesamiento del pedido")
             resultados = procesar_pedido(df_pedido, provincia)
             logger.debug(f"Resultados procesados: {json.dumps(resultados, default=serialize_numpy)}")
@@ -416,9 +405,13 @@ def procesar_pedidos_route():
             # Guardar los resultados en el CSV
             guardar_registro_envio(resultados, provincia)
             
+            # Analizar y resumir los resultados
+            resumen, mensaje_usuario = analizar_y_resumir_pedido(resultados)
+
             # Convertir resultados a un formato serializable
             serializable_resultados = json.loads(json.dumps(resultados, default=serialize_numpy))
-            return jsonify(serializable_resultados)
+            
+            return jsonify({'resultados': serializable_resultados, 'resumen': resumen, 'mensaje': mensaje_usuario})
         
         except Exception as e:
             logger.error(f"Error en procesar_pedidos_route: {str(e)}")
@@ -438,7 +431,7 @@ def procesar_pedido(df_pedido, provincia):
         cantidad = int(row['cantidad'])
 
         producto_info = df_productos[df_productos['SKU'] == sku]
-        
+
         if producto_info.empty:
             logger.warning(f'No se encontró información para el SKU: {sku}. Usando datos del pedido.')
             peso = float(row['peso bruto total'])
@@ -446,6 +439,7 @@ def procesar_pedido(df_pedido, provincia):
             alto = ancho = fondo = (volumen ** (1 / 3)) * 1000
             apilable = False
             max_apilado = 1
+            categorias = 'DESCONOCIDO'
         else:
             producto_info = producto_info.iloc[0]
             peso = float(producto_info['PESO BRUTO (kg)'])
@@ -455,9 +449,17 @@ def procesar_pedido(df_pedido, provincia):
             fondo = float(producto_info['FONDO EMBALAJE (MM)'])
             apilable = producto_info.get('APILABLE', True)
             max_apilado = int(producto_info.get('MAX_APILADO', 2))
+            categorias = producto_info['CATEGORIAS']
 
-        productos.append(Producto(sku, producto_info['CATEGORIAS'] if not producto_info.empty else 'DESCONOCIDO',
-                                  alto, ancho, fondo, volumen, peso, cantidad, apilable, max_apilado))
+            # Lógica específica para COMBI y LAVADORA
+            if 'COMBI' in categorias.upper():
+                apilable = False
+                max_apilado = 2  # Máximo 2 combis por palet
+            elif 'LAVADORA' in categorias.upper():
+                apilable = True
+                max_apilado = 8  # Máximo 8 lavadoras por palet
+
+        productos.append(Producto(sku, categorias, alto, ancho, fondo, volumen, peso, cantidad, apilable, max_apilado))
 
     palets, productos_xs, productos_especiales = empaquetar_productos(productos)
 
@@ -466,32 +468,38 @@ def procesar_pedido(df_pedido, provincia):
     # Procesar palets
     for i, palet in enumerate(palets):
         tarifas = calcular_tarifas_palet({'peso': palet.peso_actual, 'volumen': palet.volumen_actual}, provincia)
-        transportista_optimo, tarifa_optima = min(tarifas.items(), key=lambda x: x[1] if not pd.isna(x[1]) else float('inf'))
+        transportista_optimo, tarifa_optima = min(
+            tarifas.items(), key=lambda x: x[1] if not pd.isna(x[1]) else float('inf')
+        )
         resultados.append({
             'tipo': 'Palet',
             'numero': i + 1,
-            'productos': [{'SKU': p.sku, 'CANTIDAD': p.cantidad} for p in palet.productos],
+            'productos': [{'SKU': p['sku'], 'CANTIDAD': p['cantidad']} for p in palet.productos],
             'peso': palet.peso_actual,
             'volumen': palet.volumen_actual,
             'transportista_optimo': transportista_optimo,
             'tarifa_optima': tarifa_optima,
             'tarifas': tarifas
         })
-    
+
     # Procesar productos XS
     if productos_xs:
-        tarifas = calcular_tarifas_xs({'peso': sum(p.peso_total for p in productos_xs), 'volumen': sum(p.volumen_total for p in productos_xs)}, provincia)
-        transportista_optimo, tarifa_optima = min(tarifas.items(), key=lambda x: x[1] if not pd.isna(x[1]) else float('inf'))
+        total_peso_xs = sum(p.peso_total for p in productos_xs)
+        total_volumen_xs = sum(p.volumen_total for p in productos_xs)
+        tarifas = calcular_tarifas_xs({'peso': total_peso_xs, 'volumen': total_volumen_xs}, provincia)
+        transportista_optimo, tarifa_optima = min(
+            tarifas.items(), key=lambda x: x[1] if not pd.isna(x[1]) else float('inf')
+        )
         resultados.append({
             'tipo': 'XS',
             'productos': [{'SKU': p.sku, 'CANTIDAD': p.cantidad} for p in productos_xs],
-            'peso': sum(p.peso_total for p in productos_xs),
-            'volumen': sum(p.volumen_total for p in productos_xs),
+            'peso': total_peso_xs,
+            'volumen': total_volumen_xs,
             'transportista_optimo': transportista_optimo,
             'tarifa_optima': tarifa_optima,
             'tarifas': tarifas
         })
-    
+
     # Procesar productos especiales
     if productos_especiales:
         resultados.append({
@@ -571,6 +579,112 @@ def guardar_registro_envio(resultados, provincia):
                         fecha_actual,
                         mensaje
                     ])
+# Función para analizar y resumir el pedido
+def analizar_y_resumir_pedido(resultados):
+    logger.debug(f"Iniciando análisis y resumen de {len(resultados)} resultados")
+    total_palets = 0
+    total_xs = 0
+    total_precio_cbl = 0
+    total_precio_ontime = 0
+    total_precio_mrw = 0
+    conteo_transportistas = {"CBL": 0, "ONTIME": 0, "MRW": 0}
+    resumen_por_envio = []
+
+    for resultado in resultados:
+        if resultado['tipo'] == 'Palet':
+            logger.debug(f"Procesando palet {resultado['numero']} con {len(resultado['productos'])} productos")
+            total_palets += 1
+            total_precio_cbl += resultado['tarifas'].get('CBL', 0)
+            total_precio_ontime += resultado['tarifas'].get('ONTIME', 0)
+            conteo_transportistas[resultado['transportista_optimo']] += 1
+
+            # Asegúrate de mostrar correctamente todos los productos y sus cantidades
+            productos_str = ", ".join([f"{p['CANTIDAD']} x {p['SKU']}" for p in resultado['productos']])
+            
+            resumen_por_envio.append({
+                'tipo': 'Palet',
+                'numero': resultado['numero'],
+                'productos': productos_str,  # Mostrar todos los productos correctamente
+                'precio_CBL': resultado['tarifas'].get('CBL', 'N/A'),
+                'precio_ONTIME': resultado['tarifas'].get('ONTIME', 'N/A'),
+                'transportista_optimo': resultado['transportista_optimo']
+            })
+        elif resultado['tipo'] == 'XS':
+            logger.debug(f"Procesando envío XS {resultado['numero']} con {len(resultado['productos'])} productos")
+            total_xs += 1
+            total_precio_cbl += resultado['tarifas'].get('CBL', 0)
+            total_precio_ontime += resultado['tarifas'].get('ONTIME', 0)
+            total_precio_mrw += resultado['tarifas'].get('MRW', 0)
+            conteo_transportistas[resultado['transportista_optimo']] += 1
+
+            productos = ", ".join([f"{p['CANTIDAD']} x {p['SKU']}" for p in resultado['productos']])
+
+            resumen_por_envio.append({
+                'tipo': 'XS',
+                'numero': resultado['numero'],
+                'productos': productos,  # Mostrar los productos correctamente
+                'precio_CBL': resultado['tarifas'].get('CBL', 'N/A'),
+                'precio_ONTIME': resultado['tarifas'].get('ONTIME', 'N/A'),
+                'precio_MRW': resultado['tarifas'].get('MRW', 'N/A'),
+                'transportista_optimo': resultado['transportista_optimo']
+            })
+
+    transportista_mayoritario = max(conteo_transportistas, key=conteo_transportistas.get) if conteo_transportistas else 'No disponible'
+    total_precio_por_transportista = {
+        'CBL': total_precio_cbl,
+        'ONTIME': total_precio_ontime,
+        'MRW': total_precio_mrw if total_xs > 0 else 0
+    }
+    transportista_optimo_total = min(
+        (k for k, v in total_precio_por_transportista.items() if v > 0), 
+        key=lambda k: total_precio_por_transportista[k],
+        default='No disponible'
+    )
+
+    resumen = {
+        'total_palets': total_palets,
+        'total_xs': total_xs,
+        'precio_total_CBL': total_precio_cbl,
+        'precio_total_ONTIME': total_precio_ontime,
+        'precio_total_MRW': total_precio_mrw,
+        'transportista_mayoritario': transportista_mayoritario,
+        'transportista_optimo_total': transportista_optimo_total,
+        'resumen_por_envio': resumen_por_envio,
+        'conteo_transportistas': conteo_transportistas
+    }
+
+    mensaje_usuario = f"""
+    Resumen del pedido:
+    - Total de palets: {total_palets}
+    - Total de envíos XS: {total_xs}
+    - Precio total con CBL: {total_precio_cbl:.2f}€
+    - Precio total con ONTIME: {total_precio_ontime:.2f}€
+    - Precio total con MRW: {total_precio_mrw:.2f}€
+
+    El transportista mayoritario en los envíos individuales es {transportista_mayoritario}.
+    El transportista más económico para todo el pedido es {transportista_optimo_total}.
+
+    Recomendación: Utilizar {transportista_optimo_total} para todo el pedido.
+
+    Detalle por envío:
+    """
+    for envio in resumen_por_envio:
+        if envio['tipo'] == 'Palet':
+            productos_str = envio['productos']
+            precio_cbl = f"{envio['precio_CBL']:.2f}€" if envio['precio_CBL'] != 'N/A' else 'N/A'
+            precio_ontime = f"{envio['precio_ONTIME']:.2f}€" if envio['precio_ONTIME'] != 'N/A' else 'N/A'
+            mensaje_usuario += f"Palet {envio['numero']} ({productos_str}): CBL ({precio_cbl}), ONTIME ({precio_ontime}) "
+            mensaje_usuario += f"-> Más económico: {envio['transportista_optimo']}\n"
+        else:
+            productos_str = envio['productos']
+            precio_cbl = f"{envio['precio_CBL']:.2f}€" if envio['precio_CBL'] != 'N/A' else 'N/A'
+            precio_ontime = f"{envio['precio_ONTIME']:.2f}€" if envio['precio_ONTIME'] != 'N/A' else 'N/A'
+            precio_mrw = f"{envio['precio_MRW']:.2f}€" if envio['precio_MRW'] != 'N/A' else 'N/A'
+            mensaje_usuario += f"XS {envio['numero']} ({productos_str}): CBL ({precio_cbl}), ONTIME ({precio_ontime}), MRW ({precio_mrw}) "
+            mensaje_usuario += f"-> Más económico: {envio['transportista_optimo']}\n"
+
+    logger.debug(f"Resumen completado: {total_palets} palets, {total_xs} XS, {len(resumen_por_envio)} envíos en total")
+    return resumen, mensaje_usuario
 
 def calcular_tarifas_envios(envios, provincia):
     """

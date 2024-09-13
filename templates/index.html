@@ -5,6 +5,140 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Calculadora de Transporte</title>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f4f9;
+            margin: 0;
+            padding: 0;
+        }
+
+        h1, h2, h3 {
+            color: #333;
+        }
+
+        h1 {
+            background-color: #3e8e41;
+            color: white;
+            padding: 20px;
+            text-align: center;
+            margin: 0;
+        }
+
+        h2 {
+            color: #3e8e41;
+            margin-bottom: 10px;
+        }
+
+        form {
+            background-color: white;
+            padding: 20px;
+            margin: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        label {
+            display: block;
+            margin: 10px 0 5px;
+            font-weight: bold;
+        }
+
+        input[type="file"], input[type="text"], input[type="number"], select, button {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+        }
+
+        button {
+            background-color: #3e8e41;
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        button:hover {
+            background-color: #357a38;
+        }
+
+        #resultados {
+            background-color: white;
+            padding: 20px;
+            margin: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+
+        ul li {
+            background-color: #f9f9f9;
+            margin: 5px 0;
+            padding: 10px;
+            border-left: 4px solid #3e8e41;
+        }
+
+        p {
+            margin: 10px 0;
+            color: #555;
+        }
+
+        .result-header {
+            font-weight: bold;
+            color: #333;
+            margin-top: 20px;
+        }
+
+        .tarifas-list ul {
+            padding-left: 15px;
+            margin-bottom: 15px;
+        }
+
+        .tarifas-list ul li {
+            margin-bottom: 5px;
+        }
+
+        .highlight {
+            font-weight: bold;
+            color: #333;
+        }
+
+        .resumen-section {
+            background-color: #f1f8f9;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #d1d1d1;
+        }
+
+        .recomendacion {
+            background-color: #e0f7fa;
+            padding: 15px;
+            border-left: 4px solid #00acc1;
+            margin-top: 20px;
+            white-space: pre-line;
+        }
+
+        .cbl {
+            color: red;
+            font-weight: bold;
+        }
+
+        .ontime {
+            color: blue;
+            font-weight: bold;
+        }
+
+        .recomendacion p {
+            margin: 10px 0;
+            line-height: 1.5;
+        }
+    </style>
     <script>
         $(document).ready(function() {
             $('#pedido-form').on('submit', function(e) {
@@ -20,7 +154,7 @@
                     success: function(response) {
                         console.log('Respuesta del servidor:', response);
                         try {
-                            $('#resultados').html(formatResults(response));
+                            $('#resultados').html(formatResults(response.resultados, response.resumen, response.mensaje));
                         } catch (error) {
                             console.error('Error al formatear resultados:', error);
                             $('#resultados').html('<p>Error al procesar los resultados. Por favor, revise la consola para más detalles.</p>');
@@ -33,7 +167,7 @@
                 });
             });
 
-            function formatResults(results) {
+            function formatResults(results, resumen, mensaje) {
                 console.log('Formateando resultados:', results);
                 if (!results || results.length === 0) {
                     return '<p>No se encontraron resultados.</p>';
@@ -47,7 +181,7 @@
                 };
 
                 results.forEach((envio, index) => {
-                    html += `<h3>Envío ${index + 1} - ${envio.tipo}</h3>`;
+                    html += `<div class="result-header">Envío ${index + 1} - ${envio.tipo}</div>`;
                     totalEnvios[envio.tipo]++;
 
                     if (envio.error) {
@@ -58,26 +192,26 @@
                     if (envio.tipo === 'Especial') {
                         html += `<p>${envio.mensaje}</p>`;
                     } else {
-                        html += `<p>Peso: ${envio.peso ? envio.peso.toFixed(2) : 'N/A'} kg</p>`;
-                        html += `<p>Volumen: ${envio.volumen ? envio.volumen.toFixed(2) : 'N/A'} m³</p>`;
+                        html += `<p><span class="highlight">Peso:</span> ${envio.peso ? envio.peso.toFixed(2) : 'N/A'} kg</p>`;
+                        html += `<p><span class="highlight">Volumen:</span> ${envio.volumen ? envio.volumen.toFixed(2) : 'N/A'} m³</p>`;
 
                         if (envio.transportista_optimo) {
-                            html += `<p>Transportista más barato: ${envio.transportista_optimo} (${envio.tarifa_optima ? envio.tarifa_optima.toFixed(2) : 'N/A'}€)</p>`;
+                            html += `<p><span class="highlight">Transportista más barato:</span> <span class="${envio.transportista_optimo.toLowerCase()}">${envio.transportista_optimo}</span> (${envio.tarifa_optima ? envio.tarifa_optima.toFixed(2) : 'N/A'}€)</p>`;
                         } else {
                             html += `<p>No se encontró un transportista óptimo.</p>`;
                         }
 
                         if (envio.tarifas) {
-                            html += '<h4>Tarifas:</h4><ul>';
+                            html += '<div class="tarifas-list"><h4>Tarifas:</h4><ul>';
                             for (let transportista in envio.tarifas) {
                                 let tarifa = envio.tarifas[transportista];
                                 if (tarifa !== null && !isNaN(tarifa)) {
-                                    html += `<li>${transportista}: ${tarifa.toFixed(2)}€</li>`;
+                                    html += `<li><span class="${transportista.toLowerCase()}">${transportista}</span>: ${tarifa.toFixed(2)}€</li>`;
                                 } else {
                                     html += `<li>${transportista}: No disponible</li>`;
                                 }
                             }
-                            html += '</ul>';
+                            html += '</ul></div>';
                         }
                     }
 
@@ -93,10 +227,18 @@
                     }
                 });
 
-                html += '<h3>Resumen de Envíos</h3>';
-                html += `<p>Palets: ${totalEnvios['Palet']}</p>`;
-                html += `<p>XS: ${totalEnvios['XS']}</p>`;
-                html += `<p>Especiales: ${totalEnvios['Especial']}</p>`;
+                // Añadimos el resumen
+                html += '<h3 class="resumen-section">Resumen de Envíos</h3>';
+                html += `<p>Palets: ${resumen.total_palets}</p>`;
+                html += `<p>XS: ${resumen.total_xs}</p>`;
+                html += `<p>Precio total con <span class="cbl">CBL</span>: ${resumen.precio_total_CBL.toFixed(2)}€</p>`;
+                html += `<p>Precio total con <span class="ontime">ONTIME</span>: ${resumen.precio_total_ONTIME.toFixed(2)}€</p>`;
+                html += `<p>Precio total con MRW: ${resumen.precio_total_MRW.toFixed(2)}€</p>`;
+                html += `<p>Transportista más económico para todo el pedido: <span class="${resumen.transportista_optimo_total.toLowerCase()}">${resumen.transportista_optimo_total}</span></p>`;
+                html += `<p>Transportista más utilizado: <span class="${resumen.transportista_mayoritario.toLowerCase()}">${resumen.transportista_mayoritario}</span></p>`;
+
+                // Añadimos el mensaje del usuario
+                html += `<div class="recomendacion"><strong>Recomendación:</strong> \n${mensaje}</div>`;
 
                 return html;
             }
@@ -104,7 +246,7 @@
     </script>
 </head>
 <body>
-    <h1>Calculadora de Transporte</h1>
+    <h1>Calculadora    de Transporte</h1>
     
     <h2>Cargar Pedido</h2>
     <form id="pedido-form" enctype="multipart/form-data">
@@ -136,21 +278,23 @@
         <label for="cantidad">Cantidad:</label>
         <input type="number" name="cantidad" id="cantidad" required min="1"><br><br>
 
-        <input type="submit" value="Calcular Devolución">
+        <button type="submit">Calcular Devolución</button>
     </form>
 
-    {% if resultado_devolucion %}
-        <h2>Resultado de la Devolución</h2>
-        <ul>
-        {% for transportista, tarifa in resultado_devolucion.items() %}
-            <li>{{ transportista }}: {{ tarifa|round(2) }}€</li>
-        {% endfor %}
-        </ul>
-    {% endif %}
+    <div id="devolucion-resultados">
+        {% if resultado_devolucion %}
+            <h2>Resultado de la Devolución</h2>
+            <ul>
+            {% for transportista, tarifa in resultado_devolucion.items() %}
+                <li>{{ transportista }}: {{ tarifa|round(2) }}€</li>
+            {% endfor %}
+            </ul>
+        {% endif %}
 
-    {% if error %}
-        <h2>Error</h2>
-        <p>{{ error }}</p>
-    {% endif %}
+        {% if error %}
+            <h2>Error</h2>
+            <p>{{ error }}</p>
+        {% endif %}
+    </div>
 </body>
 </html>

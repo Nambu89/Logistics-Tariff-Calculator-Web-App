@@ -81,13 +81,13 @@ class Producto:
         self.apilable = apilable
         self.max_apilado = max_apilado
 
-        # Lógica específica para COMBI y LAVADORA
-        if 'COMBI' in categorias.upper():
+        # Lógica específica para COMBI, LAVADORA, SECADORA y LAVAVAJILLAS
+        if any(cat in categorias.upper() for cat in ['COMBI', 'FRIGO', 'REFRIGER']):
             self.apilable = False
-            self.max_apilado = 2  # Máximo 2 combis por palet
-        elif 'LAVADORA' in categorias.upper():
+            self.max_apilado = 2  # Máximo 2 productos por palet
+        elif any(cat in categorias.upper() for cat in ['LAVADORA', 'SECADORA', 'LAVAVAJILLAS']):
             self.apilable = True
-            self.max_apilado = 8  # Máximo 8 lavadoras por palet
+            self.max_apilado = 4  # Máximo 4 productos por palet
 
 class Palet:
     def __init__(self, ancho=PALET_ANCHO, fondo=PALET_FONDO, alto_max=MAX_ALTO_PALET, peso_max=MAX_PESO_PALET):
@@ -102,7 +102,7 @@ class Palet:
 
     def puede_agregar(self, producto, cantidad=1):
         peso_total_producto = producto.peso * cantidad
-        niveles_nuevos = ((cantidad - 1) // 4 + 1)  # Cada nivel puede tener hasta 4 lavadoras
+        niveles_nuevos = ((cantidad - 1) // 2 + 1)  # Cada nivel puede tener hasta 4 lavadoras
         altura_total_producto = producto.alto * niveles_nuevos
 
         # Verificar si excede el peso máximo del palet
@@ -114,13 +114,13 @@ class Palet:
             return False
 
         # Restricciones específicas para COMBI y LAVADORA
-        if 'COMBI' in producto.categorias.upper():
-            total_combis = sum(p['cantidad'] for p in self.productos if 'COMBI' in p['categorias'].upper())
+        if any(cat in producto.categorias.upper() for cat in ['COMBI', 'FRIGO', 'REFRIGER']):
+            total_combis = sum(p['cantidad'] for p in self.productos if any(cat in p['categorias'].upper() for cat in ['COMBI', 'FRIGO', 'REFRIGER']))
             if total_combis + cantidad > 2:
                 return False
-        elif 'LAVADORA' in producto.categorias.upper():
-            total_lavadoras = sum(p['cantidad'] for p in self.productos if 'LAVADORA' in p['categorias'].upper())
-            if total_lavadoras + cantidad > producto.max_apilado:
+        elif any(cat in producto.categorias.upper() for cat in ['LAVADORA', 'SECADORA', 'LAVAVAJILLAS']):
+            total_apilables = sum(p['cantidad'] for p in self.productos if any(cat in p['categorias'].upper() for cat in ['LAVADORA', 'SECADORA', 'LAVAVAJILLAS']))
+            if total_apilables + cantidad > producto.max_apilado:
                 return False
 
         # Verificar si hay espacio en el palet (simplificado)
@@ -132,7 +132,7 @@ class Palet:
 
         peso_total_producto = producto.peso * cantidad
         altura_por_nivel = producto.alto
-        niveles_nuevos = ( (cantidad - 1) // 4 + 1 )  # Calcula cuántos niveles nuevos se necesitan
+        niveles_nuevos = ( (cantidad - 1) // 2 + 1 )  # Calcula cuántos niveles nuevos se necesitan
 
         # Actualizar o agregar el producto en la lista de productos
         existing_product = next((p for p in self.productos if p['sku'] == producto.sku), None)
@@ -424,6 +424,17 @@ def procesar_pedidos_route():
         return jsonify({'error': 'Tipo de archivo no permitido'}), 400
 
 def procesar_pedido(df_pedido, provincia):
+    """
+    Procesa el pedido cargado y lo organiza en palets.
+    
+    Args:
+        df_pedido (DataFrame): Los datos del pedido con productos.
+        provincia (str): La provincia de destino para calcular las tarifas.
+    
+    Returns:
+        list: Una lista de diccionarios con detalles sobre palets, productos XS, y productos especiales.
+    """
+
     productos = []
 
     for _, row in df_pedido.iterrows():
@@ -452,12 +463,12 @@ def procesar_pedido(df_pedido, provincia):
             categorias = producto_info['CATEGORIAS']
 
             # Lógica específica para COMBI y LAVADORA
-            if 'COMBI' in categorias.upper():
+            if any(cat in categorias.upper() for cat in ['COMBI', 'FRIGO', 'REFRIGER']):
                 apilable = False
-                max_apilado = 2  # Máximo 2 combis por palet
-            elif 'LAVADORA' in categorias.upper():
+                max_apilado = 2  # Máximo 2 productos por palet
+            elif any(cat in categorias.upper() for cat in ['LAVADORA', 'SECADORA', 'LAVAVAJILLAS']):
                 apilable = True
-                max_apilado = 8  # Máximo 8 lavadoras por palet
+                max_apilado = 4  # Máximo 4 productos por palet
 
         productos.append(Producto(sku, categorias, alto, ancho, fondo, volumen, peso, cantidad, apilable, max_apilado))
 
@@ -756,19 +767,18 @@ def calcular_tarifas_xs(envio, provincia):
         }
 
 def calcular_tarifas_palet(envio, provincia):
-    """
-    Calcula las tarifas para envíos en palet.
-    """
     peso_volumetrico_cbl = envio['volumen'] * 200
     peso_volumetrico_ontime = envio['volumen'] * 225
 
     tarifa_cbl = obtener_tarifa_cbl(df_cbl, provincia, peso_volumetrico_cbl)
     tarifa_ontime = obtener_tarifa_ontime(df_ontime, provincia, peso_volumetrico_ontime)
 
+    # Solo recargo de combustible y seguro, sin recargo por devolución
     return {
         'CBL': (tarifa_cbl * (1 + RECARGO_COMBUSTIBLE_CBL)) if not pd.isna(tarifa_cbl) else None,
         'ONTIME': (tarifa_ontime * (1 + RECARGO_COMBUSTIBLE_ONTIME + RECARGO_SEGURO_ONTIME)) if not pd.isna(tarifa_ontime) else None
     }
+
 
 
 def calcular_devolucion():
